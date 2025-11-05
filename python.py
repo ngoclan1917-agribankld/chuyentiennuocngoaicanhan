@@ -179,7 +179,6 @@ def _try_read_csv(bio):
     raise ValueError("CSV parse failed")
 
 def _guess_date_col(df: pd.DataFrame):
-    """Nếu không tìm được tên cột ngày, đoán bằng cách parse từng cột và chọn cột có tỷ lệ parse OK cao nhất."""
     best_col, best_ratio = None, 0
     for c in df.columns:
         try:
@@ -366,10 +365,10 @@ with secR:
         st.error("Định dạng số không hợp lệ ('.' nghìn, ',' thập phân)."); foreign_amt=vnd_per_ngt=vnd_per_usd=fee=telex=0.0
     vnd_amount = round(foreign_amt * vnd_per_ngt, 0)
     total_vnd = vnd_amount + fee + telex
-    def to_usd(amount, vnd_per_ccy, vnd_per_usd): 
+    def _to_usd(amount, vnd_per_ccy, vnd_per_usd): 
         if amount is None or vnd_per_ccy<=0 or vnd_per_usd<=0: return 0.0
         return float(amount)*float(vnd_per_ccy)/float(vnd_per_usd)
-    usd_current = to_usd(foreign_amt, vnd_per_ngt, vnd_per_usd)
+    usd_current = _to_usd(foreign_amt, vnd_per_ngt, vnd_per_usd)
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Quy đổi (VND)", fmt_vn_int(vnd_amount))
     with c2: st.metric("Tổng thu (VND)", fmt_vn_int(total_vnd))
@@ -412,16 +411,7 @@ sent_sum_usd = None
 
 if check_btn and r_full and r_cc and send_date:
     # 1) Hạn mức
-    def fetch_gdp(iso2, y):
-        for yy in [y, y-1, y-2]:
-            try:
-                u=f"https://api.worldbank.org/v2/country/{iso2.lower()}/indicator/NY.GDP.PCAP.CD?date={yy}:{yy}&format=json"
-                js=requests.get(u,timeout=12).json()
-                if isinstance(js,list) and len(js)>1 and js[1] and js[1][0]["value"] is not None:
-                    return float(js[1][0]["value"]), yy
-            except Exception: pass
-        return None, None
-    cap_usd, cap_year_used = fetch_gdp(r_cc, send_date.year)
+    cap_usd, cap_year_used = fetch_gdp_per_capita_usd(r_cc, send_date.year)
     with st.expander("Hạn mức trợ cấp tối đa một năm (GDP/người, USD)", expanded=True):
         if cap_usd is not None: st.write(f"**{r_cc} – năm {cap_year_used}: {fmt_usd(cap_usd)} USD**")
         else: st.error("Không lấy được GDP/người từ World Bank.")
@@ -444,9 +434,9 @@ if check_btn and r_full and r_cc and send_date:
         def row_to_usd(row):
             amt, ccy_row = row["amount"], row["ccy_eff"]
             if ccy_row == "USD": return float(amt) if pd.notna(amt) else 0.0
-            if ccy_row == currency: return to_usd(amt, parse_vn_number(vnd_per_ngt_str or "0"), parse_vn_number(vnd_per_usd_str or "0"))
+            if ccy_row == currency: return _to_usd(amt, vnd_per_ngt, vnd_per_usd)
             rate = rates_map.get(ccy_row, 0.0); 
-            return to_usd(amt, rate, parse_vn_number(vnd_per_usd_str or "0"))
+            return _to_usd(amt, rate, vnd_per_usd)
         matched["usd"] = matched.apply(row_to_usd, axis=1)
 
         grp = matched.groupby("ccy_eff", dropna=False).agg(Amount_in_Year=("amount","sum"), Amount_in_Year_USD=("usd","sum")).reset_index().rename(columns={"ccy_eff":"CCY"})
@@ -463,10 +453,8 @@ if check_btn and r_full and r_cc and send_date:
     if cap_usd is not None:
         remain_usd = cap_usd - total_usd_in_year
         st.write(f"**Số còn được chuyển (USD)** = {fmt_usd(remain_usd)}")
-        if (float(parse_vn_number(vnd_per_ngt_str or "0"))>0 and float(parse_vn_number(vnd_per_usd_str or "0"))>0):
-            current_usd = to_usd(parse_vn_number(amt_str or "0"), parse_vn_number(vnd_per_ngt_str or "0"), parse_vn_number(vnd_per_usd_str or "0"))
-            if current_usd > remain_usd or remain_usd < 0:
-                st.error("**🚨 CHUYỂN VƯỢT HẠN MỨC**"); warning_text = "CHUYỂN VƯỢT HẠN MỨC"
+        if usd_current > remain_usd or remain_usd < 0:
+            st.error("**🚨 CHUYỂN VƯỢT HẠN MỨC**"); warning_text = "CHUYỂN VƯỢT HẠN MỨC"
 
 # =========================
 # ⬇️ XUẤT EXCEL (điền ô bên cạnh tiêu đề + sheet Summary_Year)
@@ -475,6 +463,13 @@ st.markdown("---"); st.subheader("Xuất Excel")
 template = st.file_uploader("(Khuyến nghị) Tải file Excel **mẫu in lệnh**. Hệ thống sẽ tìm các ô tiêu đề và điền **ô bên cạnh**.", type=["xlsx","xls"], key=unique_key("template_upload"))
 
 def compose_row_dict():
+    # Tránh SyntaxError khi build chuỗi hồ sơ
+    docs_list = []
+    for k in (docs or []):
+        cnt = doc_counts.get(k, 1)
+        docs_list.append(f"{k} x{cnt}")
+    docs_str = ", ".join(docs_list)
+
     return {
         "Ngày gửi": fmt_ddmmyyyy(send_date),
         "Hình thức thanh toán": pay_method,
@@ -492,15 +487,14 @@ def compose_row_dict():
         "Ngân hàng trung gian": inter_bank, "SWIFT trung gian": inter_swift,
         "Ngân hàng nhận tiền": ben_bank, "SWIFT nhận tiền": ben_swift,
         "Loại thanh toán (Cá nhân)": pay_type, "Nội dung chuyển tiền": purpose_desc,
-        "Hồ sơ cung cấp": ", ".join([f\"{k} x{doc_counts.get(k,1)}\" for k in (docs or [])]),
-        "Mã tiền tệ": currency, "Số tiền ngoại tệ": parse_vn_number(amt_str or "0"),
-        "Tỷ giá VND/NGT": parse_vn_number(vnd_per_ngt_str or "0"),
-        "Tỷ giá VND/USD": parse_vn_number(vnd_per_usd_str or "0"),
-        "Số tiền quy đổi (VND)": int(round(parse_vn_number(amt_str or "0") * parse_vn_number(vnd_per_ngt_str or "0"), 0)),
-        "Phí dịch vụ (VND)": parse_vn_number(fee_str or "0"),
-        "Điện phí (VND)": parse_vn_number(telex_str or "0"),
-        "Tổng thu (VND)": int(round(parse_vn_number(amt_str or "0") * parse_vn_number(vnd_per_ngt_str or "0") + parse_vn_number(fee_str or "0") + parse_vn_number(telex_str or "0"), 0)),
-        "Giá trị giao dịch hiện tại (USD)": to_usd(parse_vn_number(amt_str or "0"), parse_vn_number(vnd_per_ngt_str or "0"), parse_vn_number(vnd_per_usd_str or "0")),
+        "Hồ sơ cung cấp": docs_str,
+        "Mã tiền tệ": currency, "Số tiền ngoại tệ": foreign_amt,
+        "Tỷ giá VND/NGT": vnd_per_ngt, "Tỷ giá VND/USD": vnd_per_usd,
+        "Số tiền quy đổi (VND)": int(round(vnd_amount, 0)),
+        "Phí dịch vụ (VND)": int(round(parse_vn_number(fee_str or "0"), 0)),
+        "Điện phí (VND)": int(round(parse_vn_number(telex_str or "0"), 0)),
+        "Tổng thu (VND)": int(round(total_vnd, 0)),
+        "Giá trị giao dịch hiện tại (USD)": usd_current,
         "Hạn mức (GDP/người, USD)": cap_usd if cap_usd is not None else "",
         "Năm áp dụng hạn mức": cap_year_used if cap_year_used is not None else "",
         "TỔNG ĐÃ CHUYỂN TRONG NĂM (USD)": total_usd_in_year,
@@ -536,9 +530,12 @@ def export_excel_fill_template(template_file, mapping: dict, summary: pd.DataFra
 
 row_dict = compose_row_dict()
 excel_bytes = export_excel_fill_template(template, row_dict, summary_df)
-st.download_button("⬇️ Tải file Excel (điền ô bên cạnh tiêu đề & sheet Summary_Year)",
+st.download_button(
+    "⬇️ Tải file Excel (điền ô bên cạnh tiêu đề & sheet Summary_Year)",
     data=excel_bytes,
     file_name=f"lenh_chuyen_tien_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    key=unique_key("download_btn"))
-st.success("Đã vá: lọc đúng người nhận & năm, cộng dồn theo CCY; không còn yêu cầu VND/NaN khi lịch sử chỉ có USD.")
+    key=unique_key("download_btn")
+)
+
+st.success("Đã sửa lỗi cú pháp, vẫn giữ nguyên tính năng & cấu trúc; cộng dồn lịch sử hoạt động đúng và không còn VND/NaN.")
