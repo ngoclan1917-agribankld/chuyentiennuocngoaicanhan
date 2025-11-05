@@ -1,19 +1,18 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import io, csv, re
+import io, csv, re, unicodedata
 import requests
 from datetime import date, datetime
-from unidecode import unidecode
 from itertools import count
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
-# Optional (khuyến nghị)
+# ------------ (không bắt buộc) pycountry để có danh sách quốc gia/tiền tệ ------------
 try:
     import pycountry
 except Exception:
     pycountry = None
-
-from openpyxl import load_workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
 
 # =========================
 # ⚙️ CẤU HÌNH & TIÊU ĐỀ
@@ -31,20 +30,25 @@ st.markdown(
 )
 
 # =========================
-# 🧩 HÀM TIỆN ÍCH
+# 🧩 HÀM TIỆN ÍCH CHUNG
 # =========================
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+NBSP = "\u00A0"
+
 def parse_vn_number(s: str) -> float:
+    """Hỗ trợ '1.234.567,89' và số chuẩn; gỡ thẻ HTML & khoảng trắng đặc biệt."""
     if s is None:
         return 0.0
     s = str(s).strip()
-    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace(NBSP, " ")
+    s = HTML_TAG_RE.sub(" ", s)
     if s == "":
         return 0.0
+    s = s.replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
-    s = s.replace(" ", "")
     try:
         return float(s)
     except Exception:
@@ -67,23 +71,46 @@ def fmt_ddmmyyyy(d) -> str:
         return d.strftime("%d/%m/%Y")
     return ""
 
-def _tokenize_name(s: str) -> list:
-    if not isinstance(s, str):
-        return []
-    s = unidecode(s).lower()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    return [t for t in s.split() if t]
+def clean_ccy(val) -> str:
+    if val is None: return ""
+    s = str(val).strip().replace(NBSP, " ")
+    s = HTML_TAG_RE.sub(" ", s).upper()
+    return s if re.fullmatch(r"[A-Z]{3}", s) else ""
+
+def normalize_name(s: str) -> list:
+    """Bỏ HTML, bỏ dấu, chỉ giữ chữ-số, bỏ từ vô nghĩa, tách token."""
+    if s is None: return []
+    s = str(s).replace(NBSP, " ")
+    s = HTML_TAG_RE.sub(" ", s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = [t for t in s.split() if t]
+    stop = {"co","ltd","company","the","and","account","acc","fees","fee","university",
+            "bank","beneficiary","name","accountname","transfer","payment","inv"}
+    return [t for t in toks if t not in stop]
 
 def names_loose_match(a: str, b: str) -> bool:
-    A, B = set(_tokenize_name(a)), set(_tokenize_name(b))
+    """Khớp tên: bỏ dấu/HTML, không phân biệt thứ tự, token-Jaccard >= 0.7 hoặc subset."""
+    A, B = set(normalize_name(a)), set(normalize_name(b))
     if not A or not B:
         return False
-    # subset hoặc Jaccard >= 0.75
     if A.issubset(B) or B.issubset(A):
         return True
     inter = len(A & B)
     jacc = inter / max(1, len(A | B))
-    return jacc >= (0.75 if (len(A) >= 2 or len(B) >= 2) else 1.0)
+    return jacc >= 0.7
+
+def to_usd(amount: float, vnd_per_ccy: float, vnd_per_usd: float) -> float:
+    if amount is None or pd.isna(amount): return 0.0
+    if not (vnd_per_ccy and vnd_per_usd) or vnd_per_ccy<=0 or vnd_per_usd<=0: return 0.0
+    return float(amount)*float(vnd_per_ccy)/float(vnd_per_usd)
+
+def id_type_value(selected: str, other_text: str) -> str:
+    if "Khác" in (selected or "") and (other_text or "").strip(): return other_text.strip()
+    if "(Để trống)" in (selected or ""): return ""
+    return selected or ""
 
 def get_iso2_country_codes():
     items = []
@@ -107,8 +134,7 @@ def get_iso4217_codes():
             for c in pycountry.currencies:
                 if getattr(c, "alpha_3", None):
                     codes.add(c.alpha_3.upper())
-        except Exception:
-            pass
+        except Exception: pass
     if not codes:
         codes = {"USD","EUR","JPY","GBP","AUD","CAD","CHF","CNY","HKD","SGD","KRW",
                  "THB","TWD","MYR","IDR","INR","VND","NZD","SEK","NOK","DKK","RUB",
@@ -127,104 +153,132 @@ def fetch_gdp_per_capita_usd(iso2: str, year: int):
             pass
     return None, None
 
-def clean_ccy(val) -> str:
-    if val is None: return ""
-    s = str(val).strip()
-    s = re.sub(r"<[^>]+>", "", s).upper()
-    return s if re.fullmatch(r"[A-Z]{3}", s) else ""
-
-def safe_read_bytes(f): 
-    return None if f is None else io.BytesIO(f.read())
-
 # =========================
-# 📥 ĐỌC FILE LỊCH SỬ + DÒ CỘT (TỰ ĐỘNG, ẨN RAW)
+# 📥 ĐỌC FILE LỊCH SỬ (HỖ TRỢ .XLS HTML)
 # =========================
-def _find_col(df, exact, contains=()):
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    for k in exact:
-        if k in cols: return cols[k]
-    for k in list(exact)+list(contains):
-        for ck, oc in cols.items():
-            if k in ck: return oc
-    return None
+def _looks_like_html_frame(frame: pd.DataFrame) -> bool:
+    if frame is None or frame.empty: return False
+    sample = " ".join(map(str, frame.astype(str).head(2).values.ravel()))
+    return "<td" in sample.lower() or "<th" in sample.lower()
 
-def _guess_date_col(df: pd.DataFrame):
-    best, ratio = None, 0
-    for c in df.columns:
-        try:
-            parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-            r = parsed.notna().mean()
-            if r > ratio and r >= 0.4: best, ratio = c, r
-        except Exception: continue
-    return best
+def _read_any_table(uploaded_file) -> pd.DataFrame | None:
+    """Đọc Excel/CSV/HTML theo thứ tự ưu tiên và tự fallback."""
+    if uploaded_file is None: return None
+    bio = io.BytesIO(uploaded_file.read())
 
-def _try_read_excel(b): b.seek(0); return pd.read_excel(b, engine="openpyxl")
-def _try_read_html(b):
-    b.seek(0); h=b.read().decode(errors="ignore")
-    if "<table" in h.lower() or "<td" in h.lower():
-        t=pd.read_html(h, flavor="bs4"); t.sort(key=lambda x:(-x.shape[1],-x.shape[0])); return t[0]
-    raise ValueError
-def _try_read_csv(b):
-    b.seek(0); raw=b.read().decode(errors="ignore")
+    # 1) Excel (kể cả .xls chứa HTML – pandas vẫn trả dataframe)
     try:
-        dialect=csv.Sniffer().sniff(raw[:4000]); return pd.read_csv(io.StringIO(raw), sep=dialect.delimiter)
+        bio.seek(0)
+        df = pd.read_excel(bio, engine="openpyxl")
+        if df is not None and not df.empty:
+            return df
     except Exception:
-        for sep in [",",";","|","\t"]:
-            try: return pd.read_csv(io.StringIO(raw), sep=sep)
-            except Exception: continue
-    raise ValueError
+        pass
 
-def read_history(uploaded_file):
-    empty = pd.DataFrame(columns=["recipient","ccy","amount","prepared date"])
-    if uploaded_file is None: return empty
-    bio = safe_read_bytes(uploaded_file)
-    if bio is None: return empty
+    # 2) CSV
+    try:
+        bio.seek(0)
+        raw = bio.read().decode(errors="ignore")
+        try:
+            dialect = csv.Sniffer().sniff(raw[:4000])
+            df = pd.read_csv(io.StringIO(raw), sep=dialect.delimiter)
+        except Exception:
+            df = None
+            for sep in [",",";","|","\t"]:
+                try:
+                    df = pd.read_csv(io.StringIO(raw), sep=sep)
+                    break
+                except Exception:
+                    continue
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
 
-    df=None
-    for reader in (_try_read_excel,_try_read_html,_try_read_csv):
-        if df is not None: break
-        try: df=reader(bio)
-        except Exception: df=None
+    # 3) HTML table (dành riêng cho .xls chứa HTML)
+    try:
+        bio.seek(0)
+        html = bio.read().decode(errors="ignore")
+        tables = pd.read_html(html, flavor="bs4")
+        tables.sort(key=lambda x: (-x.shape[1], -x.shape[0]))
+        return tables[0]
+    except Exception:
+        return None
+
+def read_history(uploaded_file) -> pd.DataFrame:
+    """
+    Chuẩn hoá ra các cột:
+      - recipient
+      - amount (float)
+      - ccy (3-chars) (có thể trống)
+      - prepared date (datetime) (có thể trống)
+    """
+    empty = pd.DataFrame(columns=["recipient","amount","ccy","prepared date"])
+    df = _read_any_table(uploaded_file)
     if df is None or df.empty:
-        st.error("Không đọc được file lịch sử. Hãy thử Excel/CSV/HTML khác.")
+        st.error("Không đọc được file lịch sử. Vui lòng kiểm tra định dạng (Excel/CSV/HTML).")
         return empty
 
-    recip_exact = ["recipient","người nhận","nguoi nhan","beneficiary","payee",
-                   "account name","creditor","creditor name","receiver name",
-                   "beneficiary name","name"]
+    # Làm phẳng header đa cấp
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(c) for c in col if str(c) != "nan"]).strip() for col in df.columns]
+
+    # Bỏ dòng header rơi vào data (chứa nhiều tiêu đề)
+    def _row_is_header_like(row):
+        txt = " ".join(map(str, row.values))
+        txt = HTML_TAG_RE.sub(" ", txt).lower()
+        keys = ["message key","receiver","amount","người nhận","recipient","prepared date","ccy","currency","remark"]
+        return sum(k in txt for k in keys) >= 3
+    try:
+        df = df[~df.apply(_row_is_header_like, axis=1)]
+    except Exception:
+        pass
+
+    # ---- dò cột bằng từ khoá (rộng) ----
+    def _find_col(exact, contains=()):
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        for k in exact:
+            if k in cols: return cols[k]
+        for k in list(exact)+list(contains):
+            for ck, oc in cols.items():
+                if k in ck: return oc
+        return None
+
+    recip_exact = ["recipient","người nhận","nguoi nhan","beneficiary","payee","receiver name","creditor name","account name","name"]
     recip_contains = ["nguoi","nhan","beneficiar","payee","receiver","creditor","account","name"]
-    ccy_exact   = ["ccy","currency","mã tiền","ma tien","ma_tien","cur","tiền tệ"]
-    amt_exact   = ["amount","số tiền","so tien","value","gia tri","giatri","amt"]
-    date_exact  = ["prepared date","prepared_date","value date","valuedate","post date",
-                   "posting date","transaction date","tx date","ngày lập","ngay lap","date","ngày"]
+    amt_exact   = ["amount","số tiền","so tien","value","gia tri","amt"]
+    ccy_exact   = ["ccy","currency","mã tiền","ma tien","cur","tiền tệ"]
+    date_exact  = ["prepared date","value date","post date","posting date","transaction date","tx date","ngày","date"]
 
-    rcol=_find_col(df,recip_exact,recip_contains)
-    ccol=_find_col(df,ccy_exact)
-    acol=_find_col(df,amt_exact)
-    dcol=_find_col(df,date_exact) or _guess_date_col(df)
+    rcol = _find_col(recip_exact, recip_contains)
+    acol = _find_col(amt_exact)
+    ccol = _find_col(ccy_exact)
+    dcol = _find_col(date_exact)
 
-    out = pd.DataFrame()
-    if rcol is not None: out["recipient"] = df[rcol].astype(str)
-    if acol is not None: out["amount"] = df[acol]
-    if dcol is not None: out["prepared date"] = pd.to_datetime(df[dcol], dayfirst=True, errors="coerce")
-    if ccol is not None: out["ccy"] = df[ccol].apply(clean_ccy)
-    # chuẩn hoá amount
-    if "amount" in out.columns:
-        out["amount"] = out["amount"].apply(lambda x: float(x) if isinstance(x,(int,float)) else parse_vn_number(x))
-    return out
+    out = pd.DataFrame(columns=["recipient","amount","ccy","prepared date"])
+    if rcol is not None:
+        out["recipient"] = (
+            df[rcol]
+            .astype(str)
+            .str.replace(NBSP, " ", regex=False)
+            .apply(lambda s: HTML_TAG_RE.sub(" ", s))
+            .str.strip()
+        )
+    if acol is not None:
+        out["amount"] = df[acol].apply(parse_vn_number).astype(float)
+    if ccol is not None:
+        out["ccy"] = df[ccol].apply(clean_ccy)
+    else:
+        out["ccy"] = ""
+    if dcol is not None:
+        out["prepared date"] = pd.to_datetime(df[dcol], dayfirst=True, errors="coerce")
+    else:
+        out["prepared date"] = pd.NaT
 
-# =========================
-# 💵 CHUYỂN ĐỔI USD
-# =========================
-def to_usd(amount: float, vnd_per_ccy: float, vnd_per_usd: float) -> float:
-    if amount is None or pd.isna(amount): return 0.0
-    if not (vnd_per_ccy and vnd_per_usd) or vnd_per_ccy<=0 or vnd_per_usd<=0: return 0.0
-    return float(amount)*float(vnd_per_ccy)/float(vnd_per_usd)
-
-def id_type_value(selected: str, other_text: str) -> str:
-    if "Khác" in (selected or "") and (other_text or "").strip(): return other_text.strip()
-    if "(Để trống)" in (selected or ""): return ""
-    return selected or ""
+    # loại rỗng
+    out = out[out["recipient"].astype(str).str.strip() != ""]
+    out = out[out["amount"].fillna(0).astype(float) != 0]
+    return out.reset_index(drop=True)
 
 # =========================
 # 🧰 UI HELPERS
@@ -243,16 +297,18 @@ def inline_input(label_text, widget_fn, *args, key_prefix=None, **kwargs):
         return widget_fn("", *args, **kwargs)
 
 # =========================
-# 1. NGƯỜI GỬI | 2. NGƯỜI NHẬN
+# 🔝 1. NGƯỜI GỬI | 2. NGƯỜI NHẬN
 # =========================
-left_col, right_col = st.columns(2)
-ISO_COUNTRIES = get_iso2_country_codes(); COUNTRY_LABELS = [x[1] for x in ISO_COUNTRIES]
+ISO_COUNTRIES = get_iso2_country_codes()
+COUNTRY_LABELS = [x[1] for x in ISO_COUNTRIES]
 CURRENCY_CODES = get_iso4217_codes()
+
+left_col, right_col = st.columns(2)
 
 with left_col:
     st.subheader("1. Người gửi")
     send_date = inline_input("Ngày gửi tiền", st.date_input, value=date.today(), format="DD/MM/YYYY", key_prefix="send_date")
-    pay_method = inline_input("Hình thức thanh toán", st.radio, options=["Tiền mặt", "Chuyển khoản"], horizontal=True, index=0, key_prefix="pay_method")
+    pay_method = inline_input("Hình thức thanh toán", st.radio, options=["Tiền mặt","Chuyển khoản"], horizontal=True, index=0, key_prefix="pay_method")
     s_acc = s_acc_name = s_acc_bank = ""
     if pay_method == "Chuyển khoản":
         s_acc = inline_input("Số tài khoản", st.text_input, key_prefix="sender_acc")
@@ -285,9 +341,10 @@ with right_col:
     r_id_no = inline_input("Số giấy tờ (tuỳ chọn)", st.text_input, key_prefix="recv_id_no")
 
 # =========================
-# 3–6 GIAO DIỆN
+# 3–6 (hai cột cân đối)
 # =========================
 secL, secR = st.columns(2)
+
 with secL:
     st.subheader("3. Ngân hàng")
     inter_bank = inline_input("Ngân hàng trung gian", st.text_input, key_prefix="inter_bank")
@@ -307,9 +364,8 @@ with secR:
     st.subheader("5. Mục đích và số tiền")
     pay_type = inline_input("Loại thanh toán (Cá nhân)", st.selectbox, options=["Trợ cấp","Học phí","Mục đích khác"], index=0, key_prefix="pay_type")
     purpose_desc = inline_input("Nội dung chuyển tiền", st.text_area, height=80, key_prefix="purpose")
-    currency = inline_input("Mã tiền tệ", st.selectbox, options=get_iso4217_codes(),
-                            index=get_iso4217_codes().index("USD") if "USD" in get_iso4217_codes() else 0,
-                            key_prefix="currency")
+    currency = inline_input("Mã tiền tệ", st.selectbox, options=CURRENCY_CODES,
+                            index=CURRENCY_CODES.index("USD") if "USD" in CURRENCY_CODES else 0, key_prefix="currency")
     amt_str = inline_input("Số tiền ngoại tệ (VN: 1.234.567,89)", st.text_input, key_prefix="amt")
     vnd_per_ngt_str = inline_input("Tỷ giá VND/NGT (VND cho 1 NGT)", st.text_input, value="0", key_prefix="vnd_ngt")
     vnd_per_usd_str = inline_input("Tỷ giá VND/USD (VND cho 1 USD)", st.text_input, value="0", key_prefix="vnd_usd")
@@ -319,7 +375,8 @@ with secR:
     foreign_amt = parse_vn_number(amt_str or "0")
     vnd_per_ngt = parse_vn_number(vnd_per_ngt_str or "0")
     vnd_per_usd = parse_vn_number(vnd_per_usd_str or "0")
-    fee = parse_vn_number(fee_str or "0"); telex = parse_vn_number(telex_str or "0")
+    fee = parse_vn_number(fee_str or "0")
+    telex = parse_vn_number(telex_str or "0")
     vnd_amount = round(foreign_amt * vnd_per_ngt, 0)
     total_vnd = vnd_amount + fee + telex
     usd_current = to_usd(foreign_amt, vnd_per_ngt, vnd_per_usd)
@@ -330,48 +387,53 @@ with secR:
     with c3: st.metric("Giá trị hiện tại (USD)", fmt_usd(usd_current))
 
 # =========================
-# 6. LỊCH SỬ CHUYỂN TIỀN (đọc + cộng dồn THEO NGƯỜI NHẬN)
+# 6. LỊCH SỬ CHUYỂN TIỀN (CỘNG DỒN THEO NGƯỜI NHẬN)
 # =========================
 st.subheader("6. Lịch sử chuyển tiền")
 hist_file = st.file_uploader(
-    "Tải file lịch sử (.xlsx/.xls/.csv/.html). Hệ thống tự dò cột recipient, CCY, amount, prepared date.",
-    type=["csv","xlsx","xls","html","htm"],
+    "Tải file lịch sử (.xls/.xlsx/.csv/.html). App sẽ tự bóc HTML embedded trong .xls nếu có.",
+    type=["xls","xlsx","csv","html","htm"],
     key=unique_key("hist_upload")
 )
 hist_df = read_history(hist_file)
 
-# ---- Nút Kiểm tra (chỉ hiện khi Trợ cấp) ----
+# =========================
+# 🔎 Kiểm tra hạn mức (chỉ hiện khi Trợ cấp)
+# =========================
 st.markdown("---")
-check_btn = st.button("✅ Kiểm tra hạn mức (GDP/người, quy đổi USD)", key=unique_key("check_btn")) if pay_type=="Trợ cấp" else None
+check_btn = st.button("✅ Kiểm tra hạn mức (GDP/người, quy đổi USD)", key=unique_key("check_btn")) if pay_type == "Trợ cấp" else None
 
 cap_usd = cap_year_used = remain_usd = None
 summary_df = pd.DataFrame(columns=["Recipient","CCY","Amount_Total","Amount_Total_USD"])
 total_usd_all = 0.0
 warning_text = ""
 
-# ---------- XỬ LÝ NÚT ----------
 if check_btn and r_full and r_cc:
-    # 1) Lấy GDP/người theo năm ngày gửi
-    cap_usd, cap_year_used = fetch_gdp_per_capita_usd(r_cc, send_date.year)
+    # 1) GDP/người (World Bank) theo năm của ngày gửi
+    try:
+        cap_usd, cap_year_used = fetch_gdp_per_capita_usd(r_cc, send_date.year)
+    except Exception:
+        cap_usd, cap_year_used = None, None
     with st.expander("Hạn mức trợ cấp tối đa (GDP/người, USD)", expanded=True):
-        if cap_usd is not None: st.write(f"**{r_cc} – năm {cap_year_used}: {fmt_usd(cap_usd)} USD**")
-        else: st.error("Không lấy được GDP/người từ World Bank.")
+        if cap_usd is not None:
+            st.write(f"**{r_cc} – năm {cap_year_used}: {fmt_usd(cap_usd)} USD**")
+        else:
+            st.warning("Không lấy được GDP/người từ World Bank.")
 
-    # 2) Lọc lịch sử THEO NGƯỜI NHẬN (không lọc năm)
+    # 2) Lọc lịch sử THEO NGƯỜI NHẬN (không lọc theo năm)
     if not hist_df.empty and "recipient" in hist_df.columns and "amount" in hist_df.columns:
         matched = hist_df[hist_df["recipient"].astype(str).apply(lambda x: names_loose_match(x, r_full))].copy()
     else:
         matched = pd.DataFrame()
 
     if not matched.empty:
-        # Chuẩn hoá CCY, trống -> dùng CCY giao dịch hiện tại
         matched["ccy_eff"] = matched.get("ccy","").apply(lambda x: x if isinstance(x,str) and re.fullmatch(r"[A-Z]{3}", x) else "").replace("", currency)
 
-        # Chỉ yêu cầu nhập VND/CCY cho các CCY ≠ USD thật sự có trong matched
+        # Chỉ hỏi tỷ giá với CCY ≠ USD thực sự xuất hiện
         nonusd = sorted({c for c in matched["ccy_eff"].unique().tolist() if c != "USD"})
         extra_rates = {}
         if nonusd:
-            st.caption("Nhập tỷ giá **VND/CCY** cho các CCY xuất hiện (khác USD):")
+            st.caption("Nhập tỷ giá **VND/CCY** cho các CCY xuất hiện trong lịch sử (khác USD):")
             cols = st.columns(min(3, len(nonusd)))
             for i, ccy in enumerate(nonusd):
                 with cols[i % len(cols)]:
@@ -384,7 +446,6 @@ if check_btn and r_full and r_cc:
             if ccy_row == currency: return to_usd(amt, vnd_per_ngt, vnd_per_usd)
             return to_usd(amt, extra_rates.get(ccy_row, 0.0), vnd_per_usd)
 
-        matched["amount"] = matched["amount"].apply(lambda x: float(x) if isinstance(x,(int,float)) else parse_vn_number(x))
         matched["usd"] = matched.apply(row_to_usd, axis=1)
 
         grp = matched.groupby("ccy_eff", dropna=False).agg(
@@ -397,7 +458,7 @@ if check_btn and r_full and r_cc:
     else:
         st.info("Không tìm thấy giao dịch nào khớp **tên người nhận** trong lịch sử.")
 
-    with st.expander("Bảng cộng dồn theo CCY (đã lọc đúng người nhận & quy đổi USD)", expanded=True):
+    with st.expander("Bảng cộng dồn theo CCY (lọc đúng người nhận & quy đổi USD)", expanded=True):
         st.dataframe(summary_df, use_container_width=True)
         st.write(f"**TỔNG ĐÃ CHUYỂN (USD)**: {fmt_usd(total_usd_all)}")
 
@@ -417,8 +478,11 @@ template = st.file_uploader("(Khuyến nghị) Tải file Excel **mẫu in lện
 
 def compose_row_dict():
     docs_list = []
-    for k in (docs or []):
-        docs_list.append(f"{k} x{int(doc_counts.get(k,1))}")
+    try:
+        for k in (docs or []):
+            docs_list.append(f"{k} x{int(st.session_state.get(f'doc_count_{k}',1))}")
+    except Exception:
+        pass
     docs_str = ", ".join(docs_list)
 
     return {
@@ -430,7 +494,7 @@ def compose_row_dict():
         "Họ tên người gửi": s_full,
         "Địa chỉ người gửi": s_addr,
         "Quốc gia người gửi (mã ISO-2)": s_country,
-        "Loại giấy tờ người gửi": id_type_value(s_id_type, s_id_type_other),
+        "Loại giấy tờ người gửi": s_id_type if s_id_type!="Khác (tự nhập)" else s_id_type_other,
         "Số giấy tờ người gửi": s_id_no,
         "Ngày cấp GTTT người gửi": fmt_ddmmyyyy(s_id_issue),
         "SĐT người gửi": s_phone,
@@ -438,7 +502,7 @@ def compose_row_dict():
         "Số tài khoản người nhận": r_acc,
         "Địa chỉ người nhận": r_addr,
         "Mã quốc gia người nhận": r_cc,
-        "Loại giấy tờ người nhận": id_type_value(r_id_type, r_id_type_other),
+        "Loại giấy tờ người nhận": r_id_type if r_id_type!="Khác (tự nhập)" else r_id_type_other,
         "Số giấy tờ người nhận": r_id_no,
         "Ngân hàng trung gian": inter_bank,
         "SWIFT trung gian": inter_swift,
@@ -449,13 +513,13 @@ def compose_row_dict():
         "Hồ sơ cung cấp": docs_str,
         "Mã tiền tệ": currency,
         "Số tiền ngoại tệ": foreign_amt,
-        "Tỷ giá VND/NGT": parse_vn_number(vnd_per_ngt_str or "0"),
-        "Tỷ giá VND/USD": parse_vn_number(vnd_per_usd_str or "0"),
-        "Số tiền quy đổi (VND)": int(round(foreign_amt*parse_vn_number(vnd_per_ngt_str or "0"),0)),
-        "Phí dịch vụ (VND)": parse_vn_number(fee_str or "0"),
-        "Điện phí (VND)": parse_vn_number(telex_str or "0"),
-        "Tổng thu (VND)": int(round(foreign_amt*parse_vn_number(vnd_per_ngt_str or "0") + parse_vn_number(fee_str or "0") + parse_vn_number(telex_str or "0"),0)),
-        "Giá trị giao dịch hiện tại (USD)": to_usd(foreign_amt, parse_vn_number(vnd_per_ngt_str or "0"), parse_vn_number(vnd_per_usd_str or "0")),
+        "Tỷ giá VND/NGT": vnd_per_ngt,
+        "Tỷ giá VND/USD": vnd_per_usd,
+        "Số tiền quy đổi (VND)": int(round(foreign_amt*vnd_per_ngt,0)),
+        "Phí dịch vụ (VND)": int(round(fee,0)),
+        "Điện phí (VND)": int(round(telex,0)),
+        "Tổng thu (VND)": int(round(foreign_amt*vnd_per_ngt + fee + telex,0)),
+        "Giá trị giao dịch hiện tại (USD)": to_usd(foreign_amt, vnd_per_ngt, vnd_per_usd),
         "Hạn mức (GDP/người, USD)": cap_usd if cap_usd is not None else "",
         "Năm áp dụng hạn mức": cap_year_used if cap_year_used is not None else "",
         "TỔNG ĐÃ CHUYỂN (USD)": total_usd_all,
@@ -473,15 +537,18 @@ def export_excel_fill_template(template_file, mapping: dict, summary: pd.DataFra
             df_map.to_excel(w, index=False, sheet_name="Lenh_Chuyen_Tien")
             df_sum.to_excel(w, index=False, sheet_name="Summary")
         out.seek(0); return out.read()
-    bio = safe_read_bytes(template_file); bio.seek(0); wb = load_workbook(bio)
+    bio = io.BytesIO(template_file.read())
+    bio.seek(0); wb = load_workbook(bio)
+    # Điền vào ô bên cạnh tiêu đề
     titles = set(mapping.keys())
     for ws in wb.worksheets:
         for row in ws.iter_rows(values_only=False):
             for cell in row:
                 if isinstance(cell.value, str):
-                    key = cell.value.strip()
+                    key = str(cell.value).strip()
                     if key in titles:
                         ws.cell(row=cell.row, column=cell.column+1, value=mapping[key])
+    # Thêm 2 sheet chuẩn
     if "Lenh_Chuyen_Tien" in wb.sheetnames: wb.remove(wb["Lenh_Chuyen_Tien"])
     ws1 = wb.create_sheet("Lenh_Chuyen_Tien")
     for r in dataframe_to_rows(df_map, index=False, header=True): ws1.append(r)
