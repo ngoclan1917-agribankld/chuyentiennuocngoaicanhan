@@ -2,21 +2,33 @@ import streamlit as st
 import pandas as pd
 import io
 import requests
-from datetime import datetime, date
+from datetime import date, datetime
 from unidecode import unidecode
 import math
 
-# Optional but recommended
+# Optional nhưng nên có
 try:
     import pycountry
 except Exception:
     pycountry = None
 
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
 # =========================
-# ⚙️ CẤU HÌNH GIAO DIỆN
+# ⚙️ CẤU HÌNH & TIỆU ĐỀ
 # =========================
-st.set_page_config(page_title="💸 Lệnh chuyển tiền quốc tế", page_icon="💸", layout="wide")
-st.title("💸 Trình tạo Lệnh chuyển tiền quốc tế (tỷ giá chéo USD & kiểm tra hạn mức Trợ cấp)")
+st.set_page_config(page_title="TẠO LỆNH CHUYỂN TIỀN QUỐC TẾ", page_icon="💸", layout="wide")
+st.markdown(
+    """
+    <h1 style="text-align:center;color:#8B0000;">
+        <span style="padding:6px 12px;border:2px solid #8B0000;border-radius:10px;">
+            TẠO LỆNH CHUYỂN TIỀN QUỐC TẾ
+        </span>
+    </h1>
+    """,
+    unsafe_allow_html=True
+)
 
 # =========================
 # 🧩 HÀM TIỆN ÍCH
@@ -58,7 +70,6 @@ def tokens_match(a: str, b: str) -> bool:
     return (ta == tb) and len(ta) > 0
 
 def get_iso2_country_codes():
-    # Trả về [(code, "code – country name")]
     items = []
     if pycountry:
         try:
@@ -66,7 +77,6 @@ def get_iso2_country_codes():
                 items.append((c.alpha_2.upper(), f"{c.alpha_2.upper()} – {c.name}"))
         except Exception:
             pass
-    # fallback rút gọn nếu pycountry không có
     if not items:
         fallback = {
             "VN": "Viet Nam", "US": "United States", "AU": "Australia", "JP": "Japan",
@@ -76,24 +86,6 @@ def get_iso2_country_codes():
         items = [(k, f"{k} – {v}") for k, v in fallback.items()]
     items.sort(key=lambda x: x[0])
     return items
-
-def country_name_from_code(code: str) -> str | None:
-    code = (code or "").upper().strip()
-    if not code or len(code) != 2:
-        return None
-    if pycountry:
-        try:
-            c = pycountry.countries.get(alpha_2=code)
-            if c:
-                return c.name
-        except Exception:
-            pass
-    fallback = {
-        "VN": "Viet Nam", "US": "United States", "AU": "Australia", "JP": "Japan",
-        "KR": "Korea, Republic of", "SG": "Singapore", "CN": "China", "DE": "Germany",
-        "FR": "France", "GB": "United Kingdom", "TH": "Thailand", "CA": "Canada"
-    }
-    return fallback.get(code)
 
 def fetch_gdp_per_capita_usd(iso2: str, year: int):
     """Trả (value_usd, used_year) với fallback year-1, year-2; nếu không có: (None,None)."""
@@ -115,14 +107,13 @@ def fetch_gdp_per_capita_usd(iso2: str, year: int):
 def read_history(file) -> pd.DataFrame:
     """Đọc CSV/XLSX, trả về cột chuẩn: recipient, amount, prepared date, currency?"""
     if file is None:
-        return pd.DataFrame(columns=["recipient", "amount", "prepared date"])
+        return pd.DataFrame(columns=["recipient", "amount", "prepared date", "currency"])
     ext = file.name.lower().split(".")[-1]
     if ext in ("xlsx", "xls"):
         df = pd.read_excel(file)
     else:
         df = pd.read_csv(file)
 
-    # map cột linh hoạt
     cols = {c.strip().lower(): c for c in df.columns}
     def pick(*keys):
         for k in keys:
@@ -134,7 +125,6 @@ def read_history(file) -> pd.DataFrame:
     recipient_col = pick("recipient", "nguoi nhan", "tên người nhận", "ten nguoi nhan")
     amount_col    = pick("amount", "so tien", "giatri", "gia tri")
     date_col      = None
-    # Ưu tiên 'prepared date', nếu không có thì bất kỳ 'date'
     for ck, oc in cols.items():
         if "prepared" in ck and "date" in ck:
             date_col = oc
@@ -164,7 +154,6 @@ def read_history(file) -> pd.DataFrame:
     else:
         out["currency"] = None
 
-    # parse amount theo chuẩn VN nếu là chuỗi
     def _amt(x):
         try:
             if isinstance(x, (int, float)) and not pd.isna(x):
@@ -183,77 +172,102 @@ def to_usd(amount: float, vnd_per_ccy: float, vnd_per_usd: float) -> float:
         return 0.0
     return float(amount) * float(vnd_per_ccy) / float(vnd_per_usd)
 
-# =========================
-# 🧭 BỐ CỤC 2 CỘT
-# =========================
-colL, colR = st.columns([1.1, 1])
+def id_type_value(selected: str, other_text: str) -> str:
+    if "Khác" in (selected or "") and (other_text or "").strip():
+        return other_text.strip()
+    if "(Để trống)" in (selected or ""):
+        return ""
+    return selected or ""
 
 # =========================
-# 📝 NHẬP THÔNG TIN
+# 🎛️ KIỂU HIỂN THỊ NHÃN BÊN CẠNH Ô NHẬP
 # =========================
-with colL:
-    st.subheader("1) Người gửi")
-    send_date = st.date_input("Ngày gửi tiền", value=date.today())
-    s_full = st.text_input("Họ tên người gửi")
-    s_acc = st.text_input("Số tài khoản người gửi")
-    s_addr = st.text_area("Địa chỉ người gửi")
-    s_country = st.text_input("Quốc gia người gửi")
-    s_id_type = st.selectbox("Loại giấy tờ người gửi", ["CCCD", "CC", "Passport", "Khác (tự nhập)"], index=0)
-    s_id_type_other = st.text_input("Loại giấy tờ khác (người gửi)", disabled=(s_id_type != "Khác (tự nhập)"))
-    s_id_no = st.text_input("Số giấy tờ người gửi")
-    s_id_issue = st.date_input("Ngày cấp giấy tờ người gửi")
-    s_phone = st.text_input("Số điện thoại người gửi")
+def inline_input(label_text, widget_fn, *args, **kwargs):
+    """Hiển thị nhãn bên trái, ô nhập bên phải (cùng hàng)."""
+    left, right = st.columns([0.38, 0.62])
+    with left:
+        st.markdown(f"**{label_text}**")
+    with right:
+        kwargs.setdefault("label_visibility", "collapsed")
+        return widget_fn("", *args, **kwargs)
 
-    st.subheader("2) Người nhận")
-    r_full = st.text_input("Họ tên người nhận")
-    r_acc = st.text_input("Số tài khoản người nhận")
-    r_addr = st.text_area("Địa chỉ người nhận")
+# =========================
+# 🔝 HÀNG TRÊN: 1. NGƯỜI GỬI | 2. NGƯỜI NHẬN
+# =========================
+left_col, right_col = st.columns(2)
 
-    st.markdown("**Mã quốc gia người nhận (ISO-3166 alpha-2)**")
-    cc_mode = st.radio("Cách nhập mã quốc gia", ["Chọn từ danh sách", "Nhập tay"], horizontal=True)
+with left_col:
+    st.subheader("1. Người gửi")
+    send_date = inline_input("Ngày gửi tiền", st.date_input, value=date.today())
+    pay_method = inline_input("Hình thức thanh toán", st.radio, options=["Tiền mặt", "Chuyển khoản"], horizontal=True, index=0)
+    s_acc = ""
+    s_acc_name = ""
+    s_acc_bank = ""
+    if pay_method == "Chuyển khoản":
+        s_acc = inline_input("Số tài khoản", st.text_input)
+        s_acc_name = inline_input("Tên tài khoản", st.text_input)
+        s_acc_bank = inline_input("Tại ngân hàng", st.text_input)
+
+    s_full = inline_input("Họ tên", st.text_input)
+    s_addr = inline_input("Địa chỉ", st.text_area, height=80)
+    s_country = inline_input("Quốc gia", st.text_input)
+    s_id_type = inline_input("Loại giấy tờ", st.selectbox, options=["CCCD", "CC", "Passport", "Khác (tự nhập)"], index=0)
+    s_id_type_other = ""
+    if s_id_type == "Khác (tự nhập)":
+        s_id_type_other = inline_input("Giấy tờ khác", st.text_input)
+    s_id_no = inline_input("Số giấy tờ", st.text_input)
+    s_id_issue = inline_input("Ngày cấp", st.date_input)
+    s_phone = inline_input("Số điện thoại", st.text_input)
+
+with right_col:
+    st.subheader("2. Người nhận")
+    r_full = inline_input("Họ tên", st.text_input)
+    r_acc = inline_input("Số tài khoản", st.text_input)
+    r_addr = inline_input("Địa chỉ", st.text_area, height=80)
+
     iso_list = get_iso2_country_codes()
-    if cc_mode == "Chọn từ danh sách":
-        cc_choice = st.selectbox("Chọn mã quốc gia", options=[x[1] for x in iso_list], index=0)
-        r_cc = cc_choice.split("–")[0].strip()
-    else:
-        r_cc = st.text_input("Nhập mã quốc gia 2 ký tự (ví dụ: VN, AU, US)").upper().strip()
+    r_cc_label = [x[1] for x in iso_list]
+    r_cc_choice = inline_input("Mã quốc gia", st.selectbox, options=r_cc_label, index=0)
+    r_cc = r_cc_choice.split("–")[0].strip()
+    # Không hiển thị gợi ý/giải thích ISO, chỉ dùng danh sách chọn
 
-    suggested_country_name = country_name_from_code(r_cc)
-    if suggested_country_name:
-        st.info(f"➡️ Mã quốc gia **{r_cc}** gợi ý: **{suggested_country_name}**")
-    else:
-        if r_cc:
-            st.warning("⚠️ Mã quốc gia nhập tay không hợp lệ theo ISO-2. Vui lòng kiểm tra.")
+    r_id_type = inline_input("Loại giấy tờ (tuỳ chọn)", st.selectbox, options=["(Để trống)", "CCCD", "CC", "Passport", "Khác (tự nhập)"], index=0)
+    r_id_type_other = ""
+    if r_id_type == "Khác (tự nhập)":
+        r_id_type_other = inline_input("Giấy tờ khác", st.text_input)
+    r_id_no = inline_input("Số giấy tờ (tuỳ chọn)", st.text_input)
 
-    r_id_type = st.selectbox("Loại giấy tờ người nhận (tuỳ chọn)", ["(Để trống)", "CCCD", "CC", "Passport", "Khác (tự nhập)"], index=0)
-    r_id_type_other = st.text_input("Loại giấy tờ khác (người nhận)", disabled=(r_id_type != "Khác (tự nhập)"))
-    r_id_no = st.text_input("Số giấy tờ người nhận (tuỳ chọn)")
+# =========================
+# ⬇️ HÀNG DƯỚI: 3–6 CHIA 2 BÊN CHO CÂN ĐỐI
+# =========================
+secL, secR = st.columns(2)
 
-    st.subheader("3) Ngân hàng")
-    inter_bank = st.text_input("Ngân hàng trung gian")
-    inter_swift = st.text_input("SWIFT CODE ngân hàng trung gian")
-    ben_bank = st.text_input("Ngân hàng nhận tiền")
-    ben_swift = st.text_input("SWIFT CODE ngân hàng nhận tiền")
+with secL:
+    st.subheader("3. Ngân hàng")
+    inter_bank = inline_input("Ngân hàng trung gian", st.text_input)
+    inter_swift = inline_input("SWIFT trung gian", st.text_input)
+    ben_bank = inline_input("Ngân hàng nhận tiền", st.text_input)
+    ben_swift = inline_input("SWIFT nhận tiền", st.text_input)
 
-    st.subheader("4) Hồ sơ cung cấp")
+    st.subheader("4. Hồ sơ cung cấp")
     doc_opts = ["CCCD", "Giấy khai sinh", "Passport", "Visa", "Thông báo học phí", "Khác"]
-    docs = st.multiselect("Chọn loại hồ sơ", options=doc_opts, default=[])
+    docs = inline_input("Chọn loại hồ sơ", st.multiselect, options=doc_opts, default=[])
     doc_counts = {}
-    for d in docs:
-        doc_counts[d] = st.number_input(f"Số lượng '{d}'", min_value=1, value=1, step=1)
+    if docs:
+        for d in docs:
+            doc_counts[d] = inline_input(f"Số lượng '{d}'", st.number_input, min_value=1, value=1, step=1)
 
-with colR:
-    st.subheader("5) Mục đích & số tiền")
-    pay_type = st.selectbox("Loại thanh toán (Cá nhân)", ["Trợ cấp", "Học phí", "Mục đích khác"], index=0)
-    purpose_desc = st.text_area("Nội dung chuyển tiền")
+with secR:
+    st.subheader("5. Mục đích và số tiền")
+    pay_type = inline_input("Loại thanh toán (Cá nhân)", st.selectbox, options=["Trợ cấp", "Học phí", "Mục đích khác"], index=0)
+    purpose_desc = inline_input("Nội dung chuyển tiền", st.text_area, height=80)
 
-    st.markdown("**Tiền tệ giao dịch & tỷ giá**")
-    currency = st.text_input("Mã tiền tệ (ISO-4217, ví dụ: USD, EUR, JPY, VND)").upper().strip() or "USD"
-    amt_str = st.text_input("Số tiền ngoại tệ (định dạng VN: 1.234.567,89)")
-    vnd_per_ngt_str = st.text_input("Tỷ giá VND/NGT (VND cho 1 đơn vị nguyên tệ)", value="0")
-    vnd_per_usd_str = st.text_input("Tỷ giá VND/USD (VND cho 1 USD)", value="0")
-    fee_str = st.text_input("Phí dịch vụ (VND)", value="0")
-    telex_str = st.text_input("Điện phí (VND)", value="0")
+    currency = inline_input("Mã tiền tệ (ISO-4217)", st.text_input).upper().strip() or "USD"
+    amt_str = inline_input("Số tiền ngoại tệ (VN: 1.234.567,89)", st.text_input)
+    vnd_per_ngt_str = inline_input("Tỷ giá VND/NGT (VND cho 1 NGT)", st.text_input, value="0")
+    vnd_per_usd_str = inline_input("Tỷ giá VND/USD (VND cho 1 USD)", st.text_input, value="0")
+    fee_str = inline_input("Phí dịch vụ (VND)", st.text_input, value="0")
+    telex_str = inline_input("Điện phí (VND)", st.text_input, value="0")
 
     # Parse
     try:
@@ -270,24 +284,24 @@ with colR:
     total_vnd = vnd_amount + fee + telex
     usd_current = to_usd(foreign_amt, vnd_per_ngt, vnd_per_usd)
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Số tiền quy đổi (VND, làm tròn 0)", fmt_vn_int(vnd_amount))
+        st.metric("Quy đổi (VND)", fmt_vn_int(vnd_amount))
     with c2:
-        st.metric("Tổng số tiền phải thu (VND)", fmt_vn_int(total_vnd))
-    st.metric("Giá trị giao dịch hiện tại (USD, theo tỷ giá chéo)", fmt_usd(usd_current))
+        st.metric("Tổng thu (VND)", fmt_vn_int(total_vnd))
+    with c3:
+        st.metric("Giá trị hiện tại (USD)", fmt_usd(usd_current))
 
 # =========================
-# 📂 LỊCH SỬ GIAO DỊCH
+# 6. LỊCH SỬ CHUYỂN TIỀN & TỶ GIÁ PHỤ
 # =========================
-st.subheader("6) Lịch sử chuyển tiền (để cộng dồn USD theo năm gửi)")
+st.subheader("6. Lịch sử chuyển tiền")
 hist_file = st.file_uploader("Tải file CSV/XLSX có cột: recipient, amount, prepared date (tuỳ chọn: currency)", type=["csv", "xlsx", "xls"])
 hist_df = read_history(hist_file)
 
-# Nếu file có nhiều loại tiền tệ, yêu cầu nhập tỷ giá VND/<mã> cho từng mã
 rates_map = {}
 if not hist_df.empty and hist_df["currency"].notna().any():
-    st.info("Phát hiện file lịch sử có cột 'currency'. Vui lòng nhập tỷ giá VND/<mã> cho từng loại xuất hiện.")
+    st.info("Đã phát hiện cột 'currency' trong lịch sử—hãy nhập tỷ giá VND/<mã> cho từng loại tiền.")
     uniq_ccy = sorted([c for c in hist_df["currency"].dropna().unique().tolist() if c and c != "None"])
     cols = st.columns(min(3, len(uniq_ccy)) if uniq_ccy else 1)
     for idx, ccy in enumerate(uniq_ccy):
@@ -299,21 +313,24 @@ if not hist_df.empty and hist_df["currency"].notna().any():
                 rates_map[ccy] = 0.0
 
 # =========================
-# 🧮 TRỢ CẤP: LẤY GDPpc & CỘNG DỒN USD
+# 🔎 NÚT KIỂM TRA HẠN MỨC (Trợ cấp)
 # =========================
-cap_usd, cap_year_used, sent_sum_usd, remain_usd = None, None, None, None
+st.markdown("---")
+check_btn = st.button("✅ Kiểm tra hạn mức (áp dụng khi Loại thanh toán = Trợ cấp)")
+
+cap_usd = cap_year_used = sent_sum_usd = remain_usd = None
 warning_text = ""
 
-if pay_type == "Trợ cấp" and r_full and r_cc and suggested_country_name and send_date:
-    # GDP per capita
+if check_btn and pay_type == "Trợ cấp" and r_full and r_cc and send_date:
+    # Lấy GDP/người
     cap_usd, cap_year_used = fetch_gdp_per_capita_usd(r_cc, send_date.year)
-    with st.expander("Hạn mức trợ cấp (GDP/người)"):
+    with st.expander("Hạn mức trợ cấp tối đa một năm (GDP/người, USD)"):
         if cap_usd is not None:
-            st.write(f"**GDP/người (USD)** của **{suggested_country_name}** cho **năm {cap_year_used}**: **{fmt_usd(cap_usd)} USD**")
+            st.write(f"**GDP/người** của **{r_cc}** cho **năm {cap_year_used}**: **{fmt_usd(cap_usd)} USD**")
         else:
             st.error("Không lấy được GDP/người từ World Bank cho mã quốc gia/năm này.")
 
-    # Cộng dồn đã chuyển trong năm (USD)
+    # Cộng dồn USD theo năm
     if not hist_df.empty:
         same_year = hist_df[hist_df["prepared date"].dt.year == send_date.year]
         mask = same_year["recipient"].astype(str).apply(lambda x: tokens_match(x, r_full))
@@ -323,7 +340,7 @@ if pay_type == "Trợ cấp" and r_full and r_cc and suggested_country_name and 
             amt = row["amount"]
             row_ccy = row.get("currency", None)
             if pd.isna(row_ccy) or not row_ccy or row_ccy == "None":
-                # giả định cùng nguyên tệ NGT với giao dịch hiện tại
+                # mặc định cùng loại nguyên tệ NGT
                 return to_usd(amt, vnd_per_ngt, vnd_per_usd)
             # có currency riêng -> cần VND/<row_ccy>
             v_row = rates_map.get(str(row_ccy).upper(), 0.0)
@@ -343,63 +360,101 @@ if pay_type == "Trợ cấp" and r_full and r_cc and suggested_country_name and 
         if usd_current > remain_usd or (remain_usd is not None and remain_usd < 0):
             st.error("**🚨 CHUYỂN VƯỢT HẠN MỨC**")
             warning_text = "CHUYỂN VƯỢT HẠN MỨC"
-        else:
-            warning_text = ""
 
 # =========================
-# ⬇️ XUẤT EXCEL
+# ⬇️ XUẤT EXCEL (KÈM THEO MẪU)
 # =========================
-st.subheader("7) Tải về Excel dữ liệu lệnh")
+st.markdown("---")
+st.subheader("Xuất Excel")
+template = st.file_uploader("(Tuỳ chọn) Tải file Excel **mẫu in lệnh** để chèn dữ liệu", type=["xlsx", "xls"])
 
-def id_type_value(selected: str, other_text: str) -> str:
-    if "Khác" in (selected or "") and (other_text or "").strip():
-        return other_text.strip()
-    if "(Để trống)" in (selected or ""):
-        return ""
-    return selected or ""
+def compose_row_dict():
+    return {
+        "send_date": send_date.isoformat() if isinstance(send_date, (date, datetime)) else "",
+        "pay_method": pay_method,
+        "sender_fullname": s_full,
+        "sender_account": s_acc if pay_method == "Chuyển khoản" else "",
+        "sender_account_name": s_acc_name if pay_method == "Chuyển khoản" else "",
+        "sender_account_bank": s_acc_bank if pay_method == "Chuyển khoản" else "",
+        "sender_addr": s_addr,
+        "sender_country": s_country,
+        "sender_id_type": id_type_value(s_id_type, s_id_type_other),
+        "sender_id_no": s_id_no,
+        "sender_id_issue_date": s_id_issue.isoformat() if isinstance(s_id_issue, (date, datetime)) else "",
+        "sender_phone": s_phone,
 
-row = {
-    "send_date": send_date.isoformat() if send_date else "",
-    "sender_fullname": s_full, "sender_account": s_acc, "sender_addr": s_addr, "sender_country": s_country,
-    "sender_id_type": id_type_value(s_id_type, s_id_type_other),
-    "sender_id_no": s_id_no, "sender_id_issue_date": s_id_issue.isoformat() if s_id_issue else "", "sender_phone": s_phone,
+        "recipient_fullname": r_full,
+        "recipient_account": r_acc,
+        "recipient_addr": r_addr,
+        "recipient_country_code": r_cc,
+        "recipient_id_type": id_type_value(r_id_type, r_id_type_other),
+        "recipient_id_no": r_id_no,
 
-    "recipient_fullname": r_full, "recipient_account": r_acc, "recipient_addr": r_addr,
-    "recipient_country_code": r_cc, "recipient_country_suggested": suggested_country_name or "",
-    "recipient_id_type": id_type_value(r_id_type, r_id_type_other), "recipient_id_no": r_id_no,
+        "intermediary_bank": inter_bank,
+        "intermediary_swift": inter_swift,
+        "beneficiary_bank": ben_bank,
+        "beneficiary_swift": ben_swift,
 
-    "intermediary_bank": inter_bank, "intermediary_swift": inter_swift,
-    "beneficiary_bank": ben_bank, "beneficiary_swift": ben_swift,
+        "pay_type_personal": pay_type,
+        "purpose_desc": purpose_desc,
+        "docs_selected": ", ".join([f"{k} x{doc_counts.get(k,1)}" for k in (docs or [])]),
 
-    "pay_type_personal": pay_type, "purpose_desc": purpose_desc,
-    "docs_selected": ", ".join([f"{k} x{doc_counts.get(k,1)}" for k in docs]),
+        "currency": currency,
+        "foreign_amount": foreign_amt,
+        "vnd_per_ngt": vnd_per_ngt,
+        "vnd_per_usd": vnd_per_usd,
+        "vnd_amount_rounded": int(round(vnd_amount, 0)) if not math.isnan(vnd_amount) else 0,
+        "service_fee_vnd": int(round(fee, 0)) if not math.isnan(fee) else 0,
+        "telex_fee_vnd": int(round(telex, 0)) if not math.isnan(telex) else 0,
+        "total_vnd": int(round(total_vnd, 0)) if not math.isnan(total_vnd) else 0,
 
-    "currency": currency, "foreign_amount": foreign_amt,
-    "vnd_per_ngt": vnd_per_ngt, "vnd_per_usd": vnd_per_usd,
-    "vnd_amount_rounded": int(round(vnd_amount, 0)) if not math.isnan(vnd_amount) else 0,
-    "service_fee_vnd": fee, "telex_fee_vnd": telex,
-    "total_vnd": int(round(total_vnd, 0)) if not math.isnan(total_vnd) else 0,
+        "usd_current": usd_current if usd_current is not None else "",
+        "cap_usd": cap_usd if cap_usd is not None else "",
+        "cap_year_used": cap_year_used if cap_year_used is not None else "",
+        "sent_sum_usd_year": sent_sum_usd if sent_sum_usd is not None else "",
+        "remain_usd": remain_usd if remain_usd is not None else "",
+        "warning": warning_text or "",
+    }
 
-    "usd_current": usd_current if usd_current is not None else "",
-    "cap_usd": cap_usd if cap_usd is not None else "",
-    "cap_year_used": cap_year_used if cap_year_used is not None else "",
-    "sent_sum_usd_year": sent_sum_usd if sent_sum_usd is not None else "",
-    "remain_usd": remain_usd if remain_usd is not None else "",
-    "warning": warning_text,
-}
+def export_excel_with_template(template_file, row_dict: dict) -> bytes:
+    """
+    Nếu có file mẫu: giữ nguyên các sheet, thêm/ghi sheet 'Lenh_Chuyen_Tien' với dữ liệu dạng bảng.
+    Nếu không có template: tạo file mới chỉ có sheet 'Lenh_Chuyen_Tien'.
+    """
+    df = pd.DataFrame([row_dict])
 
-df_out = pd.DataFrame([row])
+    if template_file is None:
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Lenh_Chuyen_Tien")
+        out.seek(0)
+        return out.read()
 
-buf = io.BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-    df_out.to_excel(writer, index=False, sheet_name="remittance")
-buf.seek(0)
+    # Có template: nạp workbook rồi thêm sheet dữ liệu
+    wb = load_workbook(template_file)
+    # Nếu đã tồn tại sheet cùng tên -> xoá để ghi lại
+    if "Lenh_Chuyen_Tien" in wb.sheetnames:
+        ws_old = wb["Lenh_Chuyen_Tien"]
+        wb.remove(ws_old)
+    ws = wb.create_sheet("Lenh_Chuyen_Tien")
+    # Ghi dataframe vào sheet
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
+
+    # Lưu ra bytes
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.read()
+
+row = compose_row_dict()
+excel_bytes = export_excel_with_template(template, row)
 
 st.download_button(
-    label="⬇️ Tải Excel dữ liệu lệnh",
-    data=buf,
-    file_name=f"remittance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+    label="⬇️ Tải file Excel (theo mẫu nếu có)",
+    data=excel_bytes,
+    file_name=f"lenh_chuyen_tien_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.success("Hoàn tất. Lưu ý: để so sánh chuẩn theo USD, hãy nhập đúng **VND/NGT** và **VND/USD**; nếu file lịch sử có nhiều đồng tiền, cần nhập đầy đủ **VND/<mã tiền>** tương ứng.")
+st.success("Sẵn sàng. Hãy dùng nút **Kiểm tra hạn mức** để so sánh với GDP/người (USD) khi mục đích là **Trợ cấp**.")
