@@ -1,9 +1,5 @@
 streamlit
 pandas
 openpyxl
-xlrd==1.2.0
 requests
-unidecode
 pycountry
-lxml
-beautifulsoup4
